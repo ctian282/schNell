@@ -1,5 +1,10 @@
 import healpy as hp
 import numpy as np
+
+import gmpy2 as gmp
+from scipy import special
+
+
 from .correlation import (
     NoiseCorrelationBase,
     NoiseCorrelationConstant,
@@ -59,6 +64,10 @@ class MapCalculator(object):
         # Normalization for I->Omega translation
         self.norm_pivot = 4 * np.pi**2 * self.f_pivot**3 / (3 * H0**2)
 
+        # setting precision to mpmath
+        ctx = gmp.get_context()
+        ctx.precision = 100
+        
     def _get_iS_f(self, f, pmat):
         # Get S matrix:
         # [n_f, n_det]
@@ -71,6 +80,18 @@ class MapCalculator(object):
         # Invert
         iS_f = np.linalg.pinv(S_f, rcond=self.rcond)
         return iS_f
+    
+    def _get_S_f(self, f, pmat):
+        # Get S matrix:
+        # [n_f, n_det]
+        S_f_diag = np.array([d.psd(f) for d in self.dets]).T
+        # [n_f, n_det, n_det]
+        S_f = np.sqrt(S_f_diag[:, :, None] * S_f_diag[:, None, :])
+        S_f *= self.rho.get_corrmat(f)
+        if pmat is not None:
+            S_f = np.einsum('ijk,lj,mk', S_f, pmat, pmat)
+        
+        return S_f
 
     def _compute_projector(self, proj):
         if proj is not None:
@@ -108,7 +129,15 @@ class MapCalculator(object):
         cp = np.cos(phi_use)
         sp = np.sin(phi_use)
         return ct, st, cp, sp
-
+    
+    def _real_Ylm(self, l, m, phi, theta):
+        if(m > 0):
+            return np.sqrt(2) * (-1)**m * np.real(special.sph_harm(m, l, phi, theta))
+        elif(m < 0):
+            return np.sqrt(2) * (-1)**m * np.imag(special.sph_harm(-m, l, phi, theta))
+        else:
+            return np.abs(special.sph_harm(m, l, phi, theta))
+        
     def _get_baseline_product(self, t, ct, st, cp, sp,
                               dA, dB):
         # Computes (x_A - x_B) . \hat{n} as a function
@@ -183,6 +212,153 @@ class MapCalculator(object):
                 g = g * phase
         return g
 
+    def _time_series_cov(self, i, j, t, f, I_theta, N_cov):
+        """ generating covariances of time series data from a Healpix map
+        i: index of first detector
+        j: index of second detector
+        
+        """
+        npix = I_theta.shape[0]
+        nside = hp.npix2nside(npix)
+        th, ph = hp.pix2ang(nside, np.arange(npix))
+        dOm = 4 * np.pi / npix
+        
+        
+        ap = self.get_antenna(i, j, t, f,
+                        th.flatten(),
+                        ph.flatten(),
+                        inc_baseline=False)
+     
+        # singal term
+        # no explicit f dependence (\mathcal{E}_f)
+        sig = (ap * I_theta).sum(axis=-1) * dOm * 2 / 5
+        
+        # dimension: [::t, ::f]
+        return sig + N_cov
+    
+       
+    def time_series_gen(self, t, f, I_theta, N_cov, Delta_T=None, seed=None):
+        """ generating time series data (little d) from a Healpix map
+        i: index of first detector
+        j: index of second detector
+        t: array of `N_t` times (in s).
+        f: array of `N_f` times (in Hz).
+        
+        """
+        
+        # if no time segment data is given
+        # use time difference in t
+        if(Delta_T == None):
+            if(len(t) > 1):
+                Delta_T = t[1] - t[0]
+            else:
+                raise ValueError('Need time segment Delta_T if parameter t is not an array!')
+        
+        if(seed != None):
+            np.random.seed(seed)
+        
+        # dimension [::t, ::f, ::A, ::B]
+        cov = np.array([ [self._time_series_cov(
+            i, j, t, f, I_theta=I_theta, N_cov=N_cov[:,i, j]) 
+                 for i in range(self.ndet) ]
+                        for j in range(self.ndet)])
+        cov = np.moveaxis(cov, [0, 1], [-2, -1])
+        
+        m1 = np.concatenate([np.real(cov) / 2, np.imag(cov) / 2], axis=-2) 
+        m2 = np.concatenate([np.imag(cov) / 2, np.real(cov) / 2], axis=-2) 
+        # dimension [::t, ::f, ::A(R and I), ::B(R and I)]
+        # 6 x 6 for ndet = 3
+        m = np.concatenate((m1, m2), axis=-1)
+        
+        
+        m_dim = len(m.shape)
+        if(m_dim == 3):
+            ds = np.array([np.random.multivariate_normal(np.zeros(co.shape[-1]), co, check_valid='raise')  
+                          for co in m[...,:,:]])
+        elif(m_dim == 4):
+            ds = np.array([[np.random.multivariate_normal(np.zeros(m[i, j].shape[-1]), m[i,j], check_valid='raise')  
+                            for j in range(len(m[0]))]
+                          for i in range(len(m))])
+        else:
+            raise ValueError('m matrix has wrong dimension !')
+        
+        ds = ds[...,:self.ndet] + 1j * ds[...,self.ndet:] 
+        
+        Ds = 2 / Delta_T * np.einsum('...i,...j->...ij', ds, ds.conjugate())
+        
+        
+        return Ds
+    
+    def mat_ralms2ang(self, lmax, nside):
+        n_alms = (lmax + 1)**2
+        npix = 12 * nside**2
+        mat = np.zeros((npix, n_alms))
+
+        ths, phs = hp.pix2ang(nside, np.arange(npix))
+
+        for pix in range(npix):
+            #print(pix)
+            idx = 0
+            theta, phi = ths[pix], phs[pix]
+            for l in range(0, lmax+1):
+                for m in range(-l, l+1):
+                    mat[pix, idx] = self._real_Ylm(l, m, phi, theta)
+                    idx += 1
+        return mat
+    
+    def _get_C_inv(self, N_cov):
+        
+        N_inv = np.linalg.pinv(N_cov, rcond=self.rcond)
+        
+        tmp = np.array([[N_inv[...,A, D] * N_inv[...,B, C] 
+                         for C in range(self.ndet) for D in range(self.ndet)] 
+                            for A in range(self.ndet) for B in range(self.ndet)])
+        tmp = np.moveaxis(tmp, [0, 1], [-2, -1])
+        
+        return tmp
+
+    # numpy array to gmpy array
+    def _np_to_gmp(self, mat, tp):
+        o_shape = mat.shape
+        mat_f = mat.flatten().astype(str)
+
+        ans = np.array([tp(x) for x in mat_f])
+    
+        return ans.reshape(o_shape)
+    
+    def _get_Gamma(self, t, f, lmax, nside):
+        npix = 12 * nside**2
+        ths, phs = hp.pix2ang(nside, np.arange(npix))
+        
+        gamma = np.array([self.get_antenna(i, j, t, f,
+                        ths.flatten(),
+                        phs.flatten(),
+                        inc_baseline=True) 
+                  for i in range(self.ndet) for j in range(self.ndet)])
+        # after movement, dimension: [::t, ::f, ::AB]
+        gamma = np.moveaxis(gamma, 0, -2)
+        
+        
+        mat2ang = self.mat_ralms2ang(lmax, nside)
+        
+        Gamma_mp = self._np_to_gmp(gamma, gmp.mpc) @  self._np_to_gmp(mat2ang, gmp.mpfr)
+
+        return Gamma_mp
+    
+    def get_GCG(self, t, f, lmax, nside, gmp_form=False):
+        Gamma_mp = self._get_Gamma(t, f, lmax, nside)
+        N_cov = self._get_S_f(f, None)
+        C_inv = self._get_C_inv(N_cov)
+        C_inv_gm = self._np_to_gmp(C_inv, gmp.mpfr)
+        C_inv_gm_T = np.swapaxes(C_inv_gm, C_inv_gm.ndim - 2, C_inv_gm.ndim - 1)
+        C_inv_gm = (C_inv_gm + C_inv_gm_T) / 2
+        
+        ans = (np.swapaxes(Gamma_mp, Gamma_mp.ndim - 2, Gamma_mp.ndim - 1).conjugate()) @ C_inv_gm @ Gamma_mp
+        if(gmp_form == True):
+            return ans
+        else:
+            return ans.astype(np.complex128)
+    
     def get_antenna(self, i, j, t, f, theta, phi,
                     pol=False, inc_baseline=True):
         """ Returns antenna pattern for a detector pair
