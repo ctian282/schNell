@@ -5,6 +5,7 @@ import gmpy2 as gmp
 from scipy import special
 
 
+
 from .correlation import (
     NoiseCorrelationBase,
     NoiseCorrelationConstant,
@@ -67,6 +68,7 @@ class MapCalculator(object):
         # setting precision to mpmath
         ctx = gmp.get_context()
         ctx.precision = 100
+
         
     def _get_iS_f(self, f, pmat):
         # Get S matrix:
