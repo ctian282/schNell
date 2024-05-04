@@ -71,7 +71,7 @@ class MapCalculator(object):
 
         
     def _get_iS_f(self, f, pmat):
-        # Get S matrix:
+        # Get inverse of S matrix (N_f^AB -1):
         # [n_f, n_det]
         S_f_diag = np.array([d.psd(f) for d in self.dets]).T
         # [n_f, n_det, n_det]
@@ -84,7 +84,7 @@ class MapCalculator(object):
         return iS_f
     
     def _get_S_f(self, f, pmat):
-        # Get S matrix:
+        # Get S matrix (N_f^AB):
         # [n_f, n_det]
         S_f_diag = np.array([d.psd(f) for d in self.dets]).T
         # [n_f, n_det, n_det]
@@ -131,14 +131,6 @@ class MapCalculator(object):
         cp = np.cos(phi_use)
         sp = np.sin(phi_use)
         return ct, st, cp, sp
-    
-    def _real_Ylm(self, l, m, phi, theta):
-        if(m > 0):
-            return np.sqrt(2) * (-1)**m * np.real(special.sph_harm(m, l, phi, theta))
-        elif(m < 0):
-            return np.sqrt(2) * (-1)**m * np.imag(special.sph_harm(-m, l, phi, theta))
-        else:
-            return np.abs(special.sph_harm(m, l, phi, theta))
         
     def _get_baseline_product(self, t, ct, st, cp, sp,
                               dA, dB):
@@ -220,7 +212,7 @@ class MapCalculator(object):
         j: index of second detector
         
         """
-        npix = I_theta.shape[0]
+        npix = I_theta.shape[-1]
         nside = hp.npix2nside(npix)
         th, ph = hp.pix2ang(nside, np.arange(npix))
         dOm = 4 * np.pi / npix
@@ -240,12 +232,13 @@ class MapCalculator(object):
     
        
     def time_series_gen(self, t, f, I_theta, N_cov, Delta_T=None, seed=None):
-        """ generating time series data (little d) from a Healpix map
-        i: index of first detector
-        j: index of second detector
+        """ generating time series data (large D) from a Healpix map I theta
         t: array of `N_t` times (in s).
         f: array of `N_f` times (in Hz).
-        
+        I_theta: One intensity may in the pixel space in Healpix 
+        N_cov: N_f^AB, noise PSDs (not its inverse!)
+        Delta_T: segment of time
+        seed: random seed
         """
         
         # if no time segment data is given
@@ -286,27 +279,12 @@ class MapCalculator(object):
         
         ds = ds[...,:self.ndet] + 1j * ds[...,self.ndet:] 
         
-        Ds = 2 / Delta_T * np.einsum('...i,...j->...ij', ds, ds.conjugate())
+        #Ds = 2 / Delta_T * np.einsum('...i,...j->...ij', ds, ds.conjugate())
         
-        
+        Ds = 2 / Delta_T * np.moveaxis(np.array( [ds[...,A] * ds[...,B].conjugate() 
+                                      for A in range(self.ndet) for B in range(self.ndet)] ), 0, -1 )
         return Ds
     
-    def mat_ralms2ang(self, lmax, nside):
-        n_alms = (lmax + 1)**2
-        npix = 12 * nside**2
-        mat = np.zeros((npix, n_alms))
-
-        ths, phs = hp.pix2ang(nside, np.arange(npix))
-
-        for pix in range(npix):
-            #print(pix)
-            idx = 0
-            theta, phi = ths[pix], phs[pix]
-            for l in range(0, lmax+1):
-                for m in range(-l, l+1):
-                    mat[pix, idx] = self._real_Ylm(l, m, phi, theta)
-                    idx += 1
-        return mat
     
     def _get_C_inv(self, N_cov):
         
@@ -319,47 +297,6 @@ class MapCalculator(object):
         
         return tmp
 
-    # numpy array to gmpy array
-    def _np_to_gmp(self, mat, tp):
-        o_shape = mat.shape
-        mat_f = mat.flatten().astype(str)
-
-        ans = np.array([tp(x) for x in mat_f])
-    
-        return ans.reshape(o_shape)
-    
-    def _get_Gamma(self, t, f, lmax, nside):
-        npix = 12 * nside**2
-        ths, phs = hp.pix2ang(nside, np.arange(npix))
-        
-        gamma = np.array([self.get_antenna(i, j, t, f,
-                        ths.flatten(),
-                        phs.flatten(),
-                        inc_baseline=True) 
-                  for i in range(self.ndet) for j in range(self.ndet)])
-        # after movement, dimension: [::t, ::f, ::AB]
-        gamma = np.moveaxis(gamma, 0, -2)
-        
-        
-        mat2ang = self.mat_ralms2ang(lmax, nside)
-        
-        Gamma_mp = self._np_to_gmp(gamma, gmp.mpc) @  self._np_to_gmp(mat2ang, gmp.mpfr)
-
-        return Gamma_mp
-    
-    def get_GCG(self, t, f, lmax, nside, gmp_form=False):
-        Gamma_mp = self._get_Gamma(t, f, lmax, nside)
-        N_cov = self._get_S_f(f, None)
-        C_inv = self._get_C_inv(N_cov)
-        C_inv_gm = self._np_to_gmp(C_inv, gmp.mpfr)
-        C_inv_gm_T = np.swapaxes(C_inv_gm, C_inv_gm.ndim - 2, C_inv_gm.ndim - 1)
-        C_inv_gm = (C_inv_gm + C_inv_gm_T) / 2
-        
-        ans = (np.swapaxes(Gamma_mp, Gamma_mp.ndim - 2, Gamma_mp.ndim - 1).conjugate()) @ C_inv_gm @ Gamma_mp
-        if(gmp_form == True):
-            return ans
-        else:
-            return ans.astype(np.complex128)
     
     def get_antenna(self, i, j, t, f, theta, phi,
                     pol=False, inc_baseline=True):
