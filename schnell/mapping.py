@@ -3,7 +3,7 @@ import numpy as np
 
 import gmpy2 as gmp
 from scipy import special
-
+from joblib import Parallel, delayed
 
 
 from .correlation import (
@@ -253,13 +253,22 @@ class MapCalculator(object):
             np.random.seed(seed)
         
         # dimension [::t, ::f, ::A, ::B]
-        cov = np.array([ [self._time_series_cov(
-            i, j, t, f, I_theta=I_theta, N_cov=N_cov[:,i, j]) 
-                 for i in range(self.ndet) ]
-                        for j in range(self.ndet)])
+        if(np.atleast_1d(f).shape[0] < 10000):
+            cov = np.array([ [self._time_series_cov(
+                i, j, t, f, I_theta=I_theta, N_cov=N_cov[:,i, j]) 
+                     for j in range(self.ndet) ]
+                            for i in range(self.ndet)])
+
+        else:
+            cov = np.array(Parallel(n_jobs=self.ndet**2)( delayed(self._time_series_cov)(
+                i, j, t, f, I_theta=I_theta, N_cov=N_cov[:,i, j]) 
+                                      for j in range(self.ndet) 
+                                        for i in range(self.ndet)
+                                     )).reshape(self.ndet, self.ndet, np.atleast_1d(f).shape[0])
+        
         cov = np.moveaxis(cov, [0, 1], [-2, -1])
         
-        m1 = np.concatenate([np.real(cov) / 2, np.imag(cov) / 2], axis=-2) 
+        m1 = np.concatenate([np.real(cov) / 2, -np.imag(cov) / 2], axis=-2) 
         m2 = np.concatenate([np.imag(cov) / 2, np.real(cov) / 2], axis=-2) 
         # dimension [::t, ::f, ::A(R and I), ::B(R and I)]
         # 6 x 6 for ndet = 3
@@ -297,6 +306,16 @@ class MapCalculator(object):
         
         return tmp
 
+    def _get_C(self, N_cov):
+        
+        #N_ = np.linalg.pinv(N_cov, rcond=self.rcond)
+        
+        tmp = np.array([[N_cov[...,A, D] * N_cov[...,B, C] 
+                         for C in range(self.ndet) for D in range(self.ndet)] 
+                            for A in range(self.ndet) for B in range(self.ndet)])
+        tmp = np.moveaxis(tmp, [0, 1], [-2, -1])
+        
+        return tmp
     
     def get_antenna(self, i, j, t, f, theta, phi,
                     pol=False, inc_baseline=True):
