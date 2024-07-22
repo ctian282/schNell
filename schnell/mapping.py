@@ -230,6 +230,41 @@ class MapCalculator(object):
         # dimension: [::t, ::f]
         return sig + N_cov
     
+    def time_series_gen_D(self, t, f, I_theta, N_cov, Delta_T=None, seed=None):
+        """ generating time series data (large D) from a Healpix map I theta
+        t: array of `N_t` times (in s).
+        f: array of `N_f` times (in Hz).
+        I_theta: One intensity may in the pixel space in Healpix 
+        N_cov: N_f^AB, noise PSDs (not its inverse!)
+        Delta_T: segment of time
+        seed: random seed
+        """
+        
+        if(seed != None):
+            np.random.seed(seed)
+        
+        # if no time segment data is given
+        # use time difference in t
+        f = np.atleast_1d(f)
+        cov = self._get_C(N_cov)
+
+        Ds_r = np.array([np.random.multivariate_normal(np.zeros(cov[fi].shape[-1]), cov[fi]/2, check_valid='raise')
+                        for fi in range(len(f))] )
+        Ds_i = np.array([np.random.multivariate_normal(np.zeros(cov[fi].shape[-1]), cov[fi]/2, check_valid='raise')
+                        for fi in range(len(f))] )
+
+        avg = np.array(Parallel(n_jobs=self.ndet**2)( delayed(self._time_series_cov)(
+                        i, j, 0, f, I_theta=I_theta, N_cov=N_cov[:,i, j]) 
+                                              for j in range(self.ndet) 
+                                                for i in range(self.ndet)
+                                             ))
+        avg = np.moveaxis(avg, -2, -1)
+        
+        #Ds = Ds.astype(np.complex128)
+        Ds = Ds_r + Ds_i * 1j
+        Ds += avg
+        
+        return Ds
        
     def time_series_gen(self, t, f, I_theta, N_cov, Delta_T=None, seed=None):
         """ generating time series data (large D) from a Healpix map I theta
@@ -287,32 +322,34 @@ class MapCalculator(object):
             raise ValueError('m matrix has wrong dimension !')
         
         ds = ds[...,:self.ndet] + 1j * ds[...,self.ndet:] 
-        
-        #Ds = 2 / Delta_T * np.einsum('...i,...j->...ij', ds, ds.conjugate())
-        
-        Ds = 2 / Delta_T * np.moveaxis(np.array( [ds[...,A] * ds[...,B].conjugate() 
+                
+        # Ds = 2 / Delta_T * np.moveaxis(np.array( [ds[...,A] * ds[...,B].conjugate() 
+        #                               for A in range(self.ndet) for B in range(self.ndet)] ), 0, -1 )
+        Ds = np.moveaxis(np.array( [ds[...,A] * ds[...,B].conjugate() 
                                       for A in range(self.ndet) for B in range(self.ndet)] ), 0, -1 )
         return Ds
     
     
-    def _get_C_inv(self, N_cov):
+    def _get_C_inv(self, N_cov, freqs, factor=1):
         
-        N_inv = np.linalg.pinv(N_cov, rcond=self.rcond)
+        #N_inv = np.linalg.pinv(N_cov, rcond=1e-10)
+        N_inv = np.concatenate([np.linalg.pinv(N_cov[freqs<0.05], rcond=0.9) ,
+                       np.linalg.pinv(N_cov[freqs>=0.05], rcond=0.9)])
         
         tmp = np.array([[N_inv[...,A, D] * N_inv[...,B, C] 
                          for C in range(self.ndet) for D in range(self.ndet)] 
-                            for A in range(self.ndet) for B in range(self.ndet)])
+                            for A in range(self.ndet) for B in range(self.ndet)]) * factor
         tmp = np.moveaxis(tmp, [0, 1], [-2, -1])
         
         return tmp
 
-    def _get_C(self, N_cov):
+    def _get_C(self, N_cov, factor=1):
         
         #N_ = np.linalg.pinv(N_cov, rcond=self.rcond)
         
         tmp = np.array([[N_cov[...,A, D] * N_cov[...,B, C] 
                          for C in range(self.ndet) for D in range(self.ndet)] 
-                            for A in range(self.ndet) for B in range(self.ndet)])
+                            for A in range(self.ndet) for B in range(self.ndet)]) * factor
         tmp = np.moveaxis(tmp, [0, 1], [-2, -1])
         
         return tmp
